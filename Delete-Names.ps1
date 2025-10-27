@@ -1,121 +1,63 @@
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [string]$Path,
-    [switch]$Recurse,
-    [switch]$Backup
+  [Parameter(Mandatory=$true)][string]$Path,
+  [string]$OutputPath,
+  [switch]$NoBackup
 )
 
-# Load the required .NET assembly for ZipFile
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# Load ZIP support (this one line is enough)
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-function Remove-NamedRangesFromWorkbookXml {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$XmlContent
-    )
-
-    $doc = New-Object System.Xml.XmlDocument
-    $doc.PreserveWhitespace = $true
-    $doc.LoadXml($XmlContent)
-
-    $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
-    $ns.AddNamespace('s', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
-
-    # Remove the entire <definedNames> element (if present)
-    $definedNames = $doc.SelectSingleNode('/s:workbook/s:definedNames', $ns)
-    $changed = $false
-    if ($definedNames -ne $null) {
-        [void]$definedNames.ParentNode.RemoveChild($definedNames)
-        $changed = $true
-    }
-
-    # Return the XmlDocument so we can save with proper UTF-8 encoding
-    [pscustomobject]@{
-        Doc     = $doc
-        Changed = $changed
-    }
+function New-TempDirectory {
+  $dir = Join-Path ([IO.Path]::GetTempPath()) ("xlsx_edit_" + [Guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $dir | Out-Null
+  $dir
 }
 
-function Remove-ExcelNamedRanges {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$XlsxFile
-    )
+$fullIn = Resolve-Path $Path | % Path
+if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = $fullIn }
 
-    if (-not (Test-Path -LiteralPath $XlsxFile)) {
-        Write-Error "File not found: $XlsxFile"
-        return
-    }
+$tempRoot   = New-TempDirectory
+$extractDir = Join-Path $tempRoot 'unzipped'
+New-Item -ItemType Directory -Path $extractDir | Out-Null
 
-    if ([System.IO.Path]::GetExtension($XlsxFile) -ne '.xlsx') {
-        Write-Warning "Skipping non-.xlsx file: $XlsxFile"
-        return
-    }
+try {
+  # Unzip
+  [IO.Compression.ZipFile]::ExtractToDirectory($fullIn, $extractDir)
 
-    if ($Backup) {
-        try {
-            Copy-Item -LiteralPath $XlsxFile -Destination ($XlsxFile + '.bak') -ErrorAction Stop
-            Write-Host "Backup created: $XlsxFile.bak"
-        } catch {
-            Write-Warning "Could not create backup for $XlsxFile: $_"
-        }
-    }
+  # Edit xl/workbook.xml
+  $wbXmlPath = Join-Path $extractDir 'xl\workbook.xml'
+  if (-not (Test-Path $wbXmlPath)) { throw "Could not find xl\workbook.xml" }
 
-    $zip = $null
-    try {
-        # Open the .xlsx as a Zip archive in Update mode
-        $zip = [System.IO.Compression.ZipFile]::Open($XlsxFile, [System.IO.Compression.ZipArchiveMode]::Update)
+  [xml]$doc = Get-Content -LiteralPath $wbXmlPath
+  $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+  $ns.AddNamespace('d', $doc.DocumentElement.NamespaceURI)
+  $defined = $doc.SelectSingleNode('/d:workbook/d:definedNames', $ns)
+  if ($defined) {
+    [void]$defined.ParentNode.RemoveChild($defined)
+    $doc.Save($wbXmlPath)
+  }
 
-        $entry = $zip.GetEntry('xl/workbook.xml')
-        if (-not $entry) {
-            Write-Error "workbook.xml not found in: $XlsxFile"
-            return
-        }
+  # Repack
+  $tempZip = Join-Path $tempRoot 'rebuilt.zip'
+  if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
+  [IO.Compression.ZipFile]::CreateFromDirectory($extractDir, $tempZip, [IO.Compression.CompressionLevel]::Optimal, $false)
 
-        # Read workbook.xml
-        $sr = New-Object System.IO.StreamReader($entry.Open())
-        $xmlContent = $sr.ReadToEnd()
-        $sr.Close()
+  # Backup (if overwriting)
+  if ($OutputPath -ieq $fullIn -and -not $NoBackup) {
+    $bak = "$fullIn.bak"
+    if (-not (Test-Path $bak)) { Copy-Item $fullIn $bak }
+  }
 
-        # Remove defined names
-        $result = Remove-NamedRangesFromWorkbookXml -XmlContent $xmlContent
-
-        if ($result.Changed) {
-            # Replace workbook.xml in the ZIP with the modified content
-            $entry.Delete()
-
-            $newEntry = $zip.CreateEntry('xl/workbook.xml', [System.IO.Compression.CompressionLevel]::Optimal)
-            $ws = $newEntry.Open()
-            # Save with UTF-8 (no BOM) so the XML declaration matches the actual encoding
-            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-            $sw = New-Object System.IO.StreamWriter($ws, $utf8NoBom)
-            $result.Doc.Save($sw)
-            $sw.Flush()
-            $sw.Close()
-            $ws.Close()
-
-            Write-Host "Removed named ranges from: $XlsxFile"
-        } else {
-            Write-Host "No named ranges found: $XlsxFile"
-        }
-    } catch {
-        Write-Error "Failed to process $XlsxFile: $_"
-    } finally {
-        if ($zip) { $zip.Dispose() }
-    }
+  if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
+  Move-Item $tempZip $OutputPath
+  Write-Host "✅ Saved: $OutputPath"
 }
-
-# Entry point: process file or folder
-if (-not (Test-Path -LiteralPath $Path)) {
-    Write-Error "Path not found: $Path"
-    exit 1
+catch {
+  Write-Error $_.Exception.Message
 }
-
-$item = Get-Item -LiteralPath $Path
-if ($item.PSIsContainer) {
-    Get-ChildItem -LiteralPath $Path -Filter '*.xlsx' -Recurse:$Recurse | ForEach-Object {
-        Remove-ExcelNamedRanges -XlsxFile $_.FullName
-    }
-} else {
-    Remove-ExcelNamedRanges -XlsxFile $item.FullName
+finally {
+  if (Test-Path $tempRoot) { Remove-Item $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
