@@ -1,10 +1,10 @@
 # Excel-Delete-Named-Ranges
 Delete all Names Ranges within an Excel Workbook
 
-Examples:
-- Single file: .\Remove-NamedRanges.ps1 -Path "C:\Files\Workbook.xlsx" -Backup
-- Folder (non-recursive): .\Remove-NamedRanges.ps1 -Path "C:\Files" -Backup
-- Folder (recursive): .\Remove-NamedRanges.ps1 -Path "C:\Files" -Recurse -Backup
+Switches:
+- -Path: Path to File
+- -NoBackup: Do not create a .bak file (optional)
+- -OutputPath: Specify a different output path (optional)
 
 What it does:
 - Opens the .xlsx ZIP package
